@@ -1,24 +1,19 @@
-import os
-from pathlib import Path
 
-import pandas as pd
+import os
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import streamlit as st
+import pandas as pd
 import chromadb
 import torch
+
 from huggingface_hub import hf_hub_download
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
-# -----------------------------
-# Configuration
-# -----------------------------
-EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
-GENERATION_MODEL = "Qwen/Qwen2.5-3B-Instruct"
-COLLECTION_NAME = "movies"
-CHROMA_PATH = "./chroma_db"
-CSV_FILENAME = "tmdb_5000_movies.csv"
+# -------------------- Configuration --------------------
 
 st.set_page_config(
     page_title="Movies RAG System",
@@ -26,264 +21,351 @@ st.set_page_config(
     layout="centered",
 )
 
+EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
+LLM_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 
-# -----------------------------
-# Load data and models
-# -----------------------------
+DB_PATH = "./chroma_db"
+COLLECTION_NAME = "movies"
+BATCH_SIZE = 64
+TOP_K = 3
+
+
+# -------------------- Text Chunking --------------------
+
+def split_text(text, chunk_size=1000, chunk_overlap=20):
+    """Split text into overlapping character chunks."""
+    text = str(text).strip()
+
+    if not text or text.lower() == "nan":
+        return []
+
+    chunks = []
+    start = 0
+
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+
+        if end < len(text):
+            boundary = text.rfind(" ", start, end)
+            if boundary > start + int(chunk_size * 0.7):
+                end = boundary
+
+        chunk = text[start:end].strip()
+
+        if chunk:
+            chunks.append(chunk)
+
+        if end >= len(text):
+            break
+
+        start = max(end - chunk_overlap, start + 1)
+
+    return chunks
+
+
+# -------------------- Dataset --------------------
+
 @st.cache_data(show_spinner=False)
-def load_movies() -> pd.DataFrame:
-    """Load a local CSV if available; otherwise download it from Hugging Face."""
-    local_csv = Path("movies.csv")
+def load_movies():
+    local_file = "movies.csv"
 
-    if local_csv.exists():
-        df = pd.read_csv(local_csv)
+    if os.path.exists(local_file):
+        file_path = local_file
     else:
         file_path = hf_hub_download(
             repo_id="alejandrowallace/tmdb-5000",
-            filename=CSV_FILENAME,
+            filename="tmdb_5000_movies.csv",
             repo_type="dataset",
         )
-        df = pd.read_csv(file_path)
 
-    required_columns = {"original_title", "overview"}
-    missing = required_columns - set(df.columns)
+    df = pd.read_csv(file_path)
+
+    required = {"original_title", "overview"}
+    missing = required - set(df.columns)
+
     if missing:
         raise ValueError(
-            "The dataset is missing required columns: " + ", ".join(sorted(missing))
+            f"Dataset is missing required columns: {missing}"
         )
 
-    df = df[["original_title", "overview"]].dropna().copy()
+    df = df[["original_title", "overview"]].copy()
+    df = df.dropna(subset=["original_title", "overview"])
+
     df["original_title"] = df["original_title"].astype(str)
     df["overview"] = df["overview"].astype(str)
-    df = df[df["overview"].str.strip().ne("")]
+
+    df = df[
+        (df["original_title"].str.strip() != "")
+        & (df["overview"].str.strip() != "")
+        & (df["overview"].str.lower() != "nan")
+    ]
+
     return df.reset_index(drop=True)
 
 
-@st.cache_resource(show_spinner="Loading the embedding model...")
+# -------------------- Embedding Model --------------------
+
+@st.cache_resource(show_spinner=False)
 def load_embedding_model():
-    return SentenceTransformer(EMBEDDING_MODEL)
+    return SentenceTransformer(EMBEDDING_MODEL, device="cpu")
 
 
-@st.cache_resource(show_spinner="Loading Qwen... This may take a few minutes.")
-def load_generator():
-    tokenizer = AutoTokenizer.from_pretrained(GENERATION_MODEL)
-    model = AutoModelForCausalLM.from_pretrained(
-        GENERATION_MODEL,
-        torch_dtype="auto",
-        device_map="auto",
+# -------------------- ChromaDB --------------------
+
+@st.cache_resource(show_spinner=False)
+def get_chroma_client():
+    os.makedirs(DB_PATH, exist_ok=True)
+
+    return chromadb.PersistentClient(path=DB_PATH)
+
+
+def get_or_build_collection(progress):
+    client = get_chroma_client()
+
+    collection = client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"},
     )
 
-    return pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer,
-    )
-
-
-@st.cache_resource(show_spinner="Preparing the movie vector database...")
-def load_or_build_collection():
-    """Create a persistent ChromaDB collection and index movie chunks once."""
-    client = chromadb.PersistentClient(path=CHROMA_PATH)
-    collection = client.get_or_create_collection(name=COLLECTION_NAME)
-
+    # Reuse the existing database when it already has documents.
     if collection.count() > 0:
+        progress.progress(1.0, text="Vector database ready.")
         return collection
 
     df = load_movies()
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=20,
-    )
+    embedding_model = load_embedding_model()
 
     records = []
+
     for _, row in df.iterrows():
-        for chunk in splitter.split_text(row["overview"]):
-            if chunk.strip():
-                records.append(
-                    {
-                        "title": row["original_title"],
-                        "chunk": chunk,
-                    }
-                )
+        for chunk in split_text(row["overview"]):
+            records.append({
+                "title": row["original_title"],
+                "chunk": chunk,
+            })
 
     if not records:
-        raise ValueError("No movie descriptions were available to index.")
+        raise ValueError("No movie descriptions were found.")
 
-    embedder = load_embedding_model()
-    batch_size = 64
+    total = len(records)
 
-    for start in range(0, len(records), batch_size):
-        batch = records[start : start + batch_size]
+    for start in range(0, total, BATCH_SIZE):
+        batch = records[start:start + BATCH_SIZE]
+
         texts = [item["chunk"] for item in batch]
-        embeddings = embedder.encode(
+
+        embeddings = embedding_model.encode(
             texts,
-            convert_to_numpy=True,
+            batch_size=16,
             show_progress_bar=False,
-        ).tolist()
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+
+        ids = [
+            f"movie_chunk_{i}"
+            for i in range(start, start + len(batch))
+        ]
 
         collection.add(
-            ids=[f"movie_chunk_{i}" for i in range(start, start + len(batch))],
+            ids=ids,
             documents=texts,
-            embeddings=embeddings,
+            embeddings=embeddings.tolist(),
             metadatas=[
-                {
-                    "original_title": item["title"],
-                    "chunk": item["chunk"],
-                }
+                {"title": item["title"]}
                 for item in batch
             ],
+        )
+
+        progress.progress(
+            min((start + len(batch)) / total, 1.0),
+            text=f"Building movie database: "
+                 f"{min(start + len(batch), total)}/{total}",
         )
 
     return collection
 
 
-# -----------------------------
-# RAG functions
-# -----------------------------
-def retrieve_movies(query: str, collection, embedder, top_k: int = 5):
-    query_embedding = embedder.encode(query).tolist()
+# -------------------- Language Model --------------------
 
-    result = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=min(top_k, collection.count()),
-        include=["metadatas", "distances"],
+@st.cache_resource(show_spinner=False)
+def load_llm():
+    tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        LLM_MODEL,
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=True,
     )
 
-    metadatas = (result.get("metadatas") or [[]])[0]
-    distances = (result.get("distances") or [[]])[0]
+    model.eval()
+
+    return tokenizer, model
+
+
+# -------------------- Retrieval --------------------
+
+def retrieve_movies(question, collection, embedding_model):
+    query_embedding = embedding_model.encode(
+        [question],
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    )[0]
+
+    results = collection.query(
+        query_embeddings=[query_embedding.tolist()],
+        n_results=min(TOP_K, collection.count()),
+        include=["documents", "metadatas", "distances"],
+    )
 
     retrieved = []
-    for metadata, distance in zip(metadatas, distances):
-        if metadata:
-            retrieved.append(
-                {
-                    "title": metadata.get("original_title", "Unknown title"),
-                    "chunk": metadata.get("chunk", ""),
-                    "distance": distance,
-                }
-            )
+
+    documents = results.get("documents", [[]])[0]
+    metadatas = results.get("metadatas", [[]])[0]
+
+    for document, metadata in zip(documents, metadatas):
+        retrieved.append({
+            "title": metadata.get("title", "Unknown"),
+            "overview": document,
+        })
+
     return retrieved
 
 
-def generate_answer(query: str, retrieved_movies, generator):
-    if not retrieved_movies:
-        return "I couldn't find relevant movie information for that question."
+# -------------------- Answer Generation --------------------
+
+def generate_answer(question, retrieved, tokenizer, model):
+    if not retrieved:
+        return "I couldn't find relevant movie information in the dataset."
 
     context = "\n\n".join(
-        f"Movie: {item['title']}\nDescription: {item['chunk']}"
-        for item in retrieved_movies
+        f"Movie: {item['title']}\n"
+        f"Overview: {item['overview']}"
+        for item in retrieved
     )
 
     messages = [
         {
             "role": "system",
             "content": (
-                "You are a movie recommendation assistant. Answer using the movie "
-                "information in the provided context. Recommend only movies present "
-                "in the context, explain briefly why they may fit the request, and "
-                "say when the context is insufficient. Do not invent plot details."
+                "You are a movie information assistant. "
+                "Answer using only the movie information provided. "
+                "If the context does not contain the answer, "
+                "say that the available data is insufficient. "
+                "Do not invent movie details. Keep answers concise."
             ),
         },
         {
             "role": "user",
             "content": (
-                f"User question: {query}\n\n"
-                f"Retrieved movie context:\n{context}\n\n"
-                "Give a clear, helpful answer with movie titles and short reasons."
+                f"Movie information:\n{context}\n\n"
+                f"Question: {question}"
             ),
         },
     ]
 
-    tokenizer = generator.tokenizer
     prompt = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True,
     )
 
-    output = generator(
+    inputs = tokenizer(
         prompt,
-        max_new_tokens=400,
-        do_sample=True,
-        temperature=0.7,
-        top_p=0.9,
-        return_full_text=False,
-        pad_token_id=tokenizer.eos_token_id,
+        return_tensors="pt",
+        truncation=True,
+        max_length=2048,
     )
-    return output[0]["generated_text"].strip()
+
+    with torch.inference_mode():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=128,
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    new_tokens = outputs[0, inputs["input_ids"].shape[1]:]
+
+    answer = tokenizer.decode(
+        new_tokens,
+        skip_special_tokens=True,
+    ).strip()
+
+    return answer or "The model did not generate an answer. Please try again."
 
 
-# -----------------------------
-# Streamlit interface
-# -----------------------------
+# -------------------- Streamlit Interface --------------------
+
 st.title("🎬 Movies RAG System")
+
 st.write(
-    "Ask for movie recommendations using a theme, mood, or storyline. "
-    "The system retrieves relevant movie descriptions and uses Qwen to form an answer."
+    "Ask questions about movies using retrieval-augmented generation "
+    "with the TMDB 5000 Movies dataset."
 )
 
 with st.sidebar:
-    st.header("Settings")
-    top_k = st.slider(
-        "Number of movie descriptions to retrieve",
-        min_value=3,
-        max_value=8,
-        value=5,
-    )
-    st.caption("The first run downloads the dataset and builds the local vector database.")
-    st.caption("Qwen2.5-3B may require substantial RAM or GPU memory.")
+    st.header("About")
+    st.write("**Dataset:** TMDB 5000 Movies")
+    st.write("**Retrieval:** Sentence Transformers + ChromaDB")
+    st.write("**Generation:** Qwen2.5-1.5B-Instruct")
 
-question = st.text_area(
-    "What kind of movie are you looking for?",
-    placeholder="e.g. Recommend movies about dreams and reality",
-    height=100,
+question = st.text_input(
+    "Ask a movie question",
+    placeholder="Recommend a movie about space exploration...",
 )
 
-examples = [
-    "What are some good movies to watch on a rainy day?",
-    "Recommend movies about dreams and reality.",
-    "Suggest a psychological thriller.",
-]
-st.write("Try an example:")
-cols = st.columns(len(examples))
-for col, example in zip(cols, examples):
-    if col.button(example, use_container_width=True):
-        st.session_state["movie_question"] = example
-
-if "movie_question" in st.session_state and not question:
-    question = st.session_state["movie_question"]
-
-if st.button("Find movies", type="primary", use_container_width=True):
+if st.button("Get Answer", type="primary"):
     if not question.strip():
-        st.warning("Please enter a question first.")
+        st.warning("Please enter a question.")
     else:
         try:
-            with st.spinner("Retrieving relevant movies..."):
-                collection = load_or_build_collection()
-                embedder = load_embedding_model()
-                retrieved = retrieve_movies(question.strip(), collection, embedder, top_k)
+            with st.spinner("Preparing the movie database..."):
+                progress = st.progress(
+                    0.0,
+                    text="Checking the vector database...",
+                )
 
-            if not retrieved:
-                st.info("No relevant movie descriptions were found.")
+                collection = get_or_build_collection(progress)
+                progress.empty()
+
+            with st.spinner("Loading the embedding model..."):
+                embedding_model = load_embedding_model()
+
+            with st.spinner("Searching for relevant movies..."):
+                retrieved = retrieve_movies(
+                    question,
+                    collection,
+                    embedding_model,
+                )
+
+            st.subheader("Retrieved Movies")
+
+            if retrieved:
+                for item in retrieved:
+                    with st.expander(item["title"]):
+                        st.write(item["overview"])
             else:
-                with st.spinner("Generating recommendations with Qwen..."):
-                    generator = load_generator()
-                    answer = generate_answer(question.strip(), retrieved, generator)
+                st.info("No relevant movies were retrieved.")
 
-                st.subheader("Recommendation")
-                st.write(answer)
+            with st.spinner(
+                "Loading the language model and generating your answer..."
+            ):
+                tokenizer, model = load_llm()
 
-                with st.expander("View retrieved movie descriptions"):
-                    for index, item in enumerate(retrieved, start=1):
-                        st.markdown(f"**{index}. {item['title']}**")
-                        st.write(item["chunk"])
-                        st.divider()
+                answer = generate_answer(
+                    question,
+                    retrieved,
+                    tokenizer,
+                    model,
+                )
+
+            st.subheader("Answer")
+            st.write(answer)
 
         except Exception as exc:
             st.error(
-                "The app could not complete the request. Check that the dependencies "
-                "are installed and that your computer has enough memory to load Qwen."
+                "The app encountered an error while processing your question."
             )
             st.exception(exc)
-
-st.caption("Dataset: TMDB 5000 Movies. This project is for learning and demonstration.")
