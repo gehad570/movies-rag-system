@@ -3,7 +3,7 @@
 ## Overview
 This project uses Retrieval-Augmented Generation (RAG) to retrieve relevant movie information and answer user queries about movies.
 
-It uses the TMDB 5000 Movies dataset, Sentence Transformers for text embeddings, ChromaDB for storing and retrieving movie information, and Qwen2.5-3B-Instruct for generating answers based on the retrieved context.
+It uses the TMDB 5000 Movies dataset, Sentence Transformers for text embeddings, ChromaDB for storing and retrieving movie information, and Qwen2.5-3B-Instruct to generate answers based on the retrieved context. The project also includes a Streamlit interface for interacting with the system.
 
 ## Technologies Used
 - Python
@@ -12,7 +12,7 @@ It uses the TMDB 5000 Movies dataset, Sentence Transformers for text embeddings,
 - ChromaDB
 - Hugging Face Transformers
 - Qwen2.5-3B-Instruct
-- Streamlit (planned)
+- Streamlit
 
 ## Dataset
 The project uses the TMDB 5000 Movies dataset, which contains movie titles, descriptions, and other movie-related information.
@@ -22,19 +22,23 @@ Dataset: https://huggingface.co/datasets/alejandrowallace/tmdb-5000
 ## How It Works
 1. Load and preprocess the movie dataset.
 2. Split movie descriptions into smaller text chunks.
-3. Convert the chunks into embeddings using Sentence Transformers.
-4. Store the embeddings and metadata in ChromaDB.
+3. Generate embeddings using Sentence Transformers.
+4. Store embeddings and movie metadata in ChromaDB.
 5. Retrieve relevant movie information based on the user's query.
-6. Use Qwen2.5-3B-Instruct to generate an answer using the retrieved context.
+6. Generate an answer using Qwen2.5-3B-Instruct and the retrieved context.
+7. Display the response through a Streamlit web interface.
 
 ## Example Queries
 - What are some good movies to watch on a rainy day?
 - Recommend movies about dreams and reality.
 - Suggest movies with a psychological thriller storyline.
 
-## Future Work
-- Build a web interface using Streamlit.
-- Improve retrieval quality and movie recommendations.
+## How to Run
+1. Clone the repository.
+2. Install the required dependencies using `requirements.txt`.
+3. Run the Streamlit application:
+
+   `streamlit run app.py`
 
 ## Author
 Gehad Fahdy
