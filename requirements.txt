@@ -7,4 +7,3 @@ sentence-transformers
 chromadb
 torch
 accelerate
-langchain-text-splitters
