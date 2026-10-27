@@ -1,4 +1,4 @@
-
+streamlit
 pandas
 numpy
 huggingface_hub
@@ -7,4 +7,4 @@ sentence-transformers
 chromadb
 torch
 accelerate
-streamlit
+langchain-text-splitters
