@@ -1,0 +1,10 @@
+
+pandas
+numpy
+huggingface_hub
+transformers
+sentence-transformers
+chromadb
+torch
+accelerate
+streamlit
